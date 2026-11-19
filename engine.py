@@ -520,6 +520,17 @@ def synthesize(
         return None, None
 
 
+def _trim_host_memory() -> None:
+    """Hand freed heap pages back to the OS. glibc keeps them after a model is freed, so
+    without this an unload returns no RAM and each reload adds to the process's size."""
+    try:
+        import ctypes
+
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass  # Not glibc (macOS, Windows, musl): nothing to do.
+
+
 def unload_model() -> bool:
     """
     Unloads the current model and releases all GPU memory.
@@ -538,11 +549,12 @@ def unload_model() -> bool:
         del chatterbox_model
         chatterbox_model = None
 
-    # 2. Reset state flags
+    # 2. Reset state flags and drop the voice cache: its conditionals are GPU tensors.
     MODEL_LOADED = False
     model_device = None
     loaded_model_type = None
     loaded_model_class_name = None
+    _conds_cache.clear()
 
     # 3. Force Python Garbage Collection
     gc.collect()
@@ -552,6 +564,7 @@ def unload_model() -> bool:
     if torch.cuda.is_available():
         logger.info("Clearing CUDA cache...")
         torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
 
     # 5. Clear GPU Cache (MPS - Apple Silicon)
     if torch.backends.mps.is_available():
@@ -563,6 +576,7 @@ def unload_model() -> bool:
                 "torch.mps.empty_cache() not available in this PyTorch version."
             )
 
+    _trim_host_memory()
     logger.info("Model unloaded and GPU memory released.")
     return True
 
