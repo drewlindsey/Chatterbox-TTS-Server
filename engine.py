@@ -266,6 +266,27 @@ def get_model_info() -> dict:
     }
 
 
+def _from_pretrained_on_device(model_class, device: str):
+    """The engine's from_pretrained, but for Turbo on CUDA the modules are built on the GPU
+    and the checkpoints read straight to it. The engine builds on the CPU and reads each
+    checkpoint into a second CPU copy before moving it, which costs several GB of RAM at
+    every load and most of the load time. Other models and devices load as before."""
+    if device != "cuda" or model_class is not ChatterboxTurboTTS:
+        return model_class.from_pretrained(device=device)
+
+    import chatterbox.tts_turbo as turbo_module
+
+    cpu_load_file = turbo_module.load_file
+    turbo_module.load_file = lambda path: cpu_load_file(path, device=device)
+    try:
+        with torch.device(device):
+            model = model_class.from_pretrained(device=device)
+    finally:
+        turbo_module.load_file = cpu_load_file
+    torch.cuda.empty_cache()  # Blocks freed while building (random init, the dropped wte).
+    return model
+
+
 def load_model() -> bool:
     """
     Loads the TTS model.
@@ -365,7 +386,7 @@ def load_model() -> bool:
                 )
 
             # Load the model using from_pretrained - handles HuggingFace downloads automatically
-            chatterbox_model = model_class.from_pretrained(device=model_device)
+            chatterbox_model = _from_pretrained_on_device(model_class, model_device)
 
             # Convert T3 to bfloat16 if enabled.
             # Token generation is memory-bandwidth bound; bf16 halves bytes read per
