@@ -62,7 +62,10 @@ from config import (
     get_audio_output_format,
 )
 
-import engine  # TTS Engine interface
+if os.environ.get("TTS_WORKER_PROCESS", "").strip().lower() in ("1", "on", "true"):
+    import engine_process as engine  # The engine in a child process; unload ends it.
+else:
+    import engine  # TTS Engine interface
 from models import (  # Pydantic models
     CustomTTSRequest,
     ErrorResponse,

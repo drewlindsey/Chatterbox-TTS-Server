@@ -239,6 +239,10 @@ class YamlConfigManager:
         """
         # Test CUDA first as it's generally preferred for ML workloads
         if torch.cuda.is_available():
+            if os.environ.get("TTS_WORKER_PROCESS", "").strip().lower() in ("1", "on", "true"):
+                # A test tensor would give this process a CUDA context it keeps for life. The
+                # engine runs in a worker process and tests CUDA itself when it loads.
+                return "cuda"
             try:
                 # Actually test CUDA functionality by creating a tensor and moving it to CUDA
                 test_tensor = torch.tensor([1.0])

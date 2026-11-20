@@ -266,6 +266,27 @@ def get_model_info() -> dict:
     }
 
 
+def _from_pretrained_on_device(model_class, device: str):
+    """The engine's from_pretrained, but for Turbo on CUDA the modules are built on the GPU
+    and the checkpoints read straight to it. The engine builds on the CPU and reads each
+    checkpoint into a second CPU copy before moving it, which costs several GB of RAM at
+    every load and most of the load time. Other models and devices load as before."""
+    if device != "cuda" or model_class is not ChatterboxTurboTTS:
+        return model_class.from_pretrained(device=device)
+
+    import chatterbox.tts_turbo as turbo_module
+
+    cpu_load_file = turbo_module.load_file
+    turbo_module.load_file = lambda path: cpu_load_file(path, device=device)
+    try:
+        with torch.device(device):
+            model = model_class.from_pretrained(device=device)
+    finally:
+        turbo_module.load_file = cpu_load_file
+    torch.cuda.empty_cache()  # Blocks freed while building (random init, the dropped wte).
+    return model
+
+
 def load_model() -> bool:
     """
     Loads the TTS model.
@@ -365,7 +386,7 @@ def load_model() -> bool:
                 )
 
             # Load the model using from_pretrained - handles HuggingFace downloads automatically
-            chatterbox_model = model_class.from_pretrained(device=model_device)
+            chatterbox_model = _from_pretrained_on_device(model_class, model_device)
 
             # Convert T3 to bfloat16 if enabled.
             # Token generation is memory-bandwidth bound; bf16 halves bytes read per
@@ -520,6 +541,17 @@ def synthesize(
         return None, None
 
 
+def _trim_host_memory() -> None:
+    """Hand freed heap pages back to the OS. glibc keeps them after a model is freed, so
+    without this an unload returns no RAM and each reload adds to the process's size."""
+    try:
+        import ctypes
+
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass  # Not glibc (macOS, Windows, musl): nothing to do.
+
+
 def unload_model() -> bool:
     """
     Unloads the current model and releases all GPU memory.
@@ -538,11 +570,12 @@ def unload_model() -> bool:
         del chatterbox_model
         chatterbox_model = None
 
-    # 2. Reset state flags
+    # 2. Reset state flags and drop the voice cache: its conditionals are GPU tensors.
     MODEL_LOADED = False
     model_device = None
     loaded_model_type = None
     loaded_model_class_name = None
+    _conds_cache.clear()
 
     # 3. Force Python Garbage Collection
     gc.collect()
@@ -552,6 +585,7 @@ def unload_model() -> bool:
     if torch.cuda.is_available():
         logger.info("Clearing CUDA cache...")
         torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
 
     # 5. Clear GPU Cache (MPS - Apple Silicon)
     if torch.backends.mps.is_available():
@@ -563,6 +597,7 @@ def unload_model() -> bool:
                 "torch.mps.empty_cache() not available in this PyTorch version."
             )
 
+    _trim_host_memory()
     logger.info("Model unloaded and GPU memory released.")
     return True
 
