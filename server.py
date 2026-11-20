@@ -6,6 +6,7 @@
 import os
 import io
 import asyncio
+import hmac
 import struct
 import logging
 import logging.handlers  # For RotatingFileHandler
@@ -200,6 +201,39 @@ app.add_middleware(
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
+
+# --- API keys (this fork) ---
+# With TTS_API_KEYS_FILE set, every request but GET /api/model-info (the healthcheck, and the
+# load state a GPU broker reads) needs `Authorization: Bearer <key>`. The file is llama-server's
+# format: one key per line, `#` lines are comments. It's read once at startup, so revoking a key
+# needs a restart. Unset, the server checks nothing, as upstream does.
+_api_keys_file = os.environ.get("TTS_API_KEYS_FILE", "").strip()
+if _api_keys_file:
+    with open(_api_keys_file, encoding="utf-8") as _f:
+        _API_KEYS = [
+            line.strip()
+            for line in _f
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+    if not _API_KEYS:
+        raise RuntimeError(f"TTS_API_KEYS_FILE ({_api_keys_file}) holds no keys")
+    logger.info(
+        f"API keys: {len(_API_KEYS)} loaded. Every route but GET /api/model-info needs one."
+    )
+
+    @app.middleware("http")
+    async def require_api_key(request: Request, call_next):
+        if request.method == "GET" and request.url.path == "/api/model-info":
+            return await call_next(request)
+        auth = request.headers.get("authorization", "")
+        token = auth[7:].strip() if auth[:7].lower() == "bearer " else ""
+        if not token or not any(
+            hmac.compare_digest(token.encode(), key.encode()) for key in _API_KEYS
+        ):
+            return JSONResponse(
+                status_code=401, content={"detail": "Missing or invalid API key."}
+            )
+        return await call_next(request)
 
 # --- Static Files and HTML Templates ---
 ui_static_path = Path(__file__).parent / "ui"
