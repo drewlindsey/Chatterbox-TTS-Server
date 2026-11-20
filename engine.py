@@ -267,23 +267,24 @@ def get_model_info() -> dict:
 
 
 def _from_pretrained_on_device(model_class, device: str):
-    """The engine's from_pretrained, but for Turbo on CUDA the modules are built on the GPU
-    and the checkpoints read straight to it. The engine builds on the CPU and reads each
-    checkpoint into a second CPU copy before moving it, which costs several GB of RAM at
-    every load and most of the load time. Other models and devices load as before."""
+    """The engine's from_pretrained, but for Turbo on CUDA the modules are built on the GPU.
+    The engine builds on the CPU and reads each checkpoint into a second CPU copy before
+    moving it, which costs several GB of RAM at every load and most of the load time.
+
+    The checkpoints are still read into RAM and copied into the GPU's modules, so the card
+    holds one copy of the model at any moment. Reading them straight to the GPU as well made
+    the card hold two for a moment: a load peaked at 7.3 GB of VRAM for a model that settles
+    at 4.9 GB, and failed beside another tenant that left less (2026-11-19). RAM peaks at about
+    the checkpoints' size while it loads, and is trimmed right after. Other models and devices
+    load as before."""
     if device != "cuda" or model_class is not ChatterboxTurboTTS:
         return model_class.from_pretrained(device=device)
 
-    import chatterbox.tts_turbo as turbo_module
-
-    cpu_load_file = turbo_module.load_file
-    turbo_module.load_file = lambda path: cpu_load_file(path, device=device)
-    try:
-        with torch.device(device):
-            model = model_class.from_pretrained(device=device)
-    finally:
-        turbo_module.load_file = cpu_load_file
+    with torch.device(device):
+        model = model_class.from_pretrained(device=device)
+    gc.collect()  # The checkpoints read into RAM.
     torch.cuda.empty_cache()  # Blocks freed while building (random init, the dropped wte).
+    _trim_host_memory()
     return model
 
 
