@@ -101,6 +101,23 @@ def _resolve_bf16_setting() -> bool:
 
 BF16_ENABLED: bool = _resolve_bf16_setting()
 
+
+# --- Turbo fast path (this fork; t3_fast.py says what each does and what it measured) ---
+# All off by default, so the server behaves as upstream's. Turbo on CUDA only; other models and
+# devices ignore them.
+#   TTS_T3_GRAPH=on       the CUDA-graph token loop, checked at load, falling back to the stock loop
+#   TTS_SLIM=on           drop the VRAM Turbo's generation never uses
+#   TTS_BF16_AUTOCAST=off with TTS_BF16 on, bf16 weights without autocast (autocast was slower)
+def _env_on(name: str, default: str) -> bool:
+    return os.environ.get(name, default).strip().lower() in ("on", "1", "true")
+
+
+T3_GRAPH: bool = _env_on("TTS_T3_GRAPH", "off")
+SLIM: bool = _env_on("TTS_SLIM", "off")
+BF16_AUTOCAST: bool = _env_on("TTS_BF16_AUTOCAST", "on")
+# Whether synthesize wraps generate in bf16 autocast; load_model settles it for the loaded model.
+_use_autocast: bool = BF16_ENABLED
+
 # --- Global Module Variables ---
 chatterbox_model: Optional[ChatterboxTTS] = None
 MODEL_LOADED: bool = False
@@ -274,7 +291,7 @@ def _from_pretrained_on_device(model_class, device: str):
     The checkpoints are still read into RAM and copied into the GPU's modules, so the card
     holds one copy of the model at any moment. Reading them straight to the GPU as well made
     the card hold two for a moment: a load peaked at 7.3 GB of VRAM for a model that settles
-    at 4.9 GB, and failed beside another tenant that left less (2026-11-19). RAM peaks at about
+    at 4.9 GB, so it failed whenever less than that was free. RAM peaks at about
     the checkpoints' size while it loads, and is trimmed right after. Other models and devices
     load as before."""
     if device != "cuda" or model_class is not ChatterboxTurboTTS:
@@ -286,6 +303,43 @@ def _from_pretrained_on_device(model_class, device: str):
     torch.cuda.empty_cache()  # Blocks freed while building (random init, the dropped wte).
     _trim_host_memory()
     return model
+
+
+def _apply_turbo_fast_path(model, model_type: str, device: str) -> None:
+    """TTS_SLIM, TTS_BF16_AUTOCAST and TTS_T3_GRAPH for Turbo on CUDA. Each step that fails is
+    logged and skipped, so the model still serves through the stock path."""
+    global _use_autocast
+    _use_autocast = BF16_ENABLED
+    if model_type != "turbo" or device != "cuda":
+        if T3_GRAPH or SLIM or not BF16_AUTOCAST:
+            logger.info("Turbo fast path: not Turbo on CUDA, so TTS_T3_GRAPH, TTS_SLIM and TTS_BF16_AUTOCAST are ignored.")
+        return
+    import t3_fast
+
+    if SLIM:
+        try:
+            freed = t3_fast.slim(model)
+            logger.info(f"TTS_SLIM: freed {freed / 2**30:.2f} GiB of VRAM the generation never uses.")
+        except Exception:
+            logger.exception("TTS_SLIM failed; continuing without it.")
+    if BF16_ENABLED and not BF16_AUTOCAST:
+        t3_fast.cast_inputs(model.t3)
+        _use_autocast = False
+        logger.info("TTS_BF16_AUTOCAST=off: T3 runs in bf16 without autocast.")
+    if T3_GRAPH:
+        try:
+            worst = t3_fast.install_graph(model)
+            logger.info(f"TTS_T3_GRAPH: CUDA-graph token loop installed (worst logit difference {worst:.4f}).")
+        except Exception:
+            logger.exception("TTS_T3_GRAPH: the graph loop failed its check; using the stock loop.")
+    if torch.cuda.is_available():
+        # Hand back what the steps above left reserved (the float32 weights bf16 replaced, the
+        # graph's warm-up).
+        torch.cuda.empty_cache()
+        logger.info(
+            f"Turbo VRAM after load: {torch.cuda.memory_allocated() / 2**30:.2f} GiB allocated, "
+            f"{torch.cuda.memory_reserved() / 2**30:.2f} GiB reserved."
+        )
 
 
 def load_model() -> bool:
@@ -400,6 +454,8 @@ def load_model() -> bool:
             else:
                 logger.info("BF16 optimization disabled (TTS_BF16=off or hardware unsupported).")
 
+            _apply_turbo_fast_path(chatterbox_model, model_type, model_device)
+
             # Store model metadata
             loaded_model_type = model_type
             loaded_model_class_name = model_class.__name__
@@ -509,7 +565,7 @@ def synthesize(
         # Call the core model's generate method.
         # autocast promotes float32 inputs to bfloat16 to match T3/S3Gen weights,
         # keeping numerically sensitive ops (softmax, norms) in float32 automatically.
-        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=BF16_ENABLED):
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=_use_autocast):
             if loaded_model_type == "multilingual":
                 wav_tensor = chatterbox_model.generate(
                     text=text,
