@@ -291,7 +291,7 @@ def _from_pretrained_on_device(model_class, device: str):
     The checkpoints are still read into RAM and copied into the GPU's modules, so the card
     holds one copy of the model at any moment. Reading them straight to the GPU as well made
     the card hold two for a moment: a load peaked at 7.3 GB of VRAM for a model that settles
-    at 4.9 GB, and failed beside another tenant that left less (2026-11-19). RAM peaks at about
+    at 4.9 GB, so it failed whenever less than that was free. RAM peaks at about
     the checkpoints' size while it loads, and is trimmed right after. Other models and devices
     load as before."""
     if device != "cuda" or model_class is not ChatterboxTurboTTS:
